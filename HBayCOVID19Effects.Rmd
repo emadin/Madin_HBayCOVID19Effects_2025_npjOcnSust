@@ -1,0 +1,886 @@
+---
+title: "Madin_HBayCOVID19Effects_2025_npjOcnSust"
+author: "Elizabeth Madin"
+date: "7/28/2025"
+output: 
+    #pdf_document: default
+    html_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, results='hide', message = FALSE, warning = FALSE)
+```
+
+
+```{r loading_libraries, echo=FALSE}
+
+# install.packages("tidyverse")       # (must comment out to knit)
+library(tidyverse)                    # dplyr package conflicts w/base R stats pckg; not a problem
+library(lubridate)
+library(viridis)
+library(lme4)                         
+library(lmerTest)                     
+library(hrbrthemes)
+library(quantreg)
+library(jtools)                       
+library(ggplot2)
+library(ggthemes)
+library(wesanderson)                  # for fun color palettes
+names(wes_palettes)
+library(png)                          # for adding images to plots
+library(bit64)                        # for converting p-values in sci notation to integers
+library(boot)                         # for function inv.logit
+library(pscl)                         # for function zeroinfl
+library(patchwork)                    # for figure compilation
+
+```
+
+
+```{r loading_data, echo=FALSE}
+
+# import datasets
+data <- read.csv("data/processed/HBay_COVID19_GoPro__VideoAnnotation_TransectsB_AllObserversCompiled_npjOcnSustArchived.csv")           
+data_monk <- read.csv("data/processed/HBay_COVID19_InSitu_MonkSealPresence_RogersLab_npjOcnSustArchived.csv") 
+data_clarity <- read.csv("data/processed/HBay_COVID19_InSitu_WaterClarity_RogersLab_npjOcnSustArchived.csv") 
+data_fish_all <- read.csv("data/processed/HBay_COVID19_InSitu_FishesAggregated_RogersLab_npjOcnSustArchived.csv") 
+data_fish_family <- read.csv("data/processed/HBay_COVID19_InSitu_FishesByFamily_RogersLab_npjOcnSustArchived.csv") 
+
+```
+
+## Part 1: Prep dataset
+
+```{r prep_dataset, echo=FALSE, include=FALSE, results='hide'}
+
+# Prep dataset
+
+## fix date format
+data$date_numeric <- ymd(data$date)   # convert date strings to class "Date" 
+data$treatment <- ifelse(data$date_numeric < "2020-12-02", "COVID", "post-COVID") 
+                                      # add col for before/after HBay reopened to public (12/02/2020)
+                                      # "COVID" = closed to public; "post-COVID" = after re-opened
+data$bites_total <- (data$number * data$bites_per_individual)    
+
+## create column "family" to identify certain key fish families
+data$family <- "other"
+data[data$genus_spp %in% c('Chlorurus_perspicillatus',
+                  'Chlorurus_sordidus', 'Chlorurus_spilurus', 'Scarus_psittacus',
+                  'Scarus_rubroviolaceus'),]$family <- "parrotfish"
+data[which(data$genus_spp=='Scarus_rubroviolaceus'), ] # test to check that it worked
+data[data$genus_spp %in% c('Acanthurus_achilles',
+                  'Acanthurus_blochii', 'Acanthurus_dussumieri', 'Acanthurus_guttatus',
+                  'Acanthurus_leucopareius', 'Acanthurus_nigrofuscus', 'Acanthurus_nigroris',
+                  'Acanthurus_thompsoni', 'Acanthurus_triostegus', 'Acanthurus_xanthopterus',
+                  'Ctenochaetus_hawaiiensis','Ctenochaetus_strigosus', 'Naso_lituratus',
+                  'Naso_unicornis'),]$family <- "surgeonfish"
+
+## calculate total observation time for each date + site combo 
+## (based on # of unique, 1-min video segments analysed)
+data_summary <-
+    data %>%
+      group_by(treatment, site, date) %>%
+      summarise(segments_analysed = length(unique(segment)))
+data_summary
+
+## calculate total observation time by date
+observation_time_by_date <-
+    data_summary %>%
+      group_by(treatment, date) %>%
+      summarise(minutes_analysed_per_date = sum(segments_analysed, na.rm=TRUE))
+observation_time_by_date
+
+## calculate total observation time by treatment
+observation_time_by_treatment <-
+    observation_time_by_date %>%
+      group_by(treatment) %>%
+      summarise(minutes_analysed_per_trmt = sum(minutes_analysed_per_date, na.rm=TRUE))
+observation_time_by_treatment
+
+## create dataset that includes only 'high-impact' sites (ie, where most of the beachgoers stay)
+data_highestimpactsite <- data[data$site ==  "Keyhole",]
+                                      # for effects at only heaviest-visited site (Keyhole)
+data_highimpactsites <- data[data$site == "Channel" | data$site ==  "Keyhole",]
+                                      # for effects at only heavily-visited sites (Keyhole, Channel)
+fish_count <-
+    data %>%
+      group_by(site, transect, date_numeric) %>%
+      summarise(fish_counted = sum(number, na.rm = TRUE), depth_observed_mean_m = mean(number, na.rm = TRUE))
+fish_count
+
+## calculate total observation time by site and date
+observation_time_by_date <-
+    data_summary %>%
+      group_by(treatment, site, date) %>%
+      summarise(minutes_analysed_per_date = sum(segments_analysed, na.rm=TRUE))
+rename(observation_time_by_date, date_numeric = date)
+
+```
+
+## Part 2: Water clarity
+
+```{r data_explore_waterclarity, fig.height=5, fig.width=5, fig.align='center', fig.keep='none'}
+
+# Prep data
+
+## rename columns
+colnames(data_clarity)[1] = "treatment"
+colnames(data_clarity)[2] = "date"
+colnames(data_clarity)[3] = "time"
+colnames(data_clarity)[4] = "site"
+colnames(data_clarity)[5] = "water_clarity_m"
+colnames(data_clarity)[6] = "human_count_day_total"
+colnames(data_clarity)[7] = "human_count_sector"
+colnames(data_clarity)[8] = "tide_coeff"
+colnames(data_clarity)[9] = "wind_speed"
+colnames(data_clarity)[10] = "wind_direction"
+
+## rename values
+data_clarity <- data_clarity %>%
+    mutate(treatment = recode(treatment, PostCOVID =  'post-COVID'))
+
+## subset dataset by site
+data_clarity_highimpactsites <- data_clarity[data_clarity$site == "Channel" | data_clarity$site ==  "Keyhole",]                           # for effects at only heavily-visited sites
+
+# Explore water clarity responses to human presence period (open vs closed)
+
+## set up plot aesthetics (colors; icon)
+wes_palette("Zissou1")                # display colors in this palette
+pal <- c(wes_palettes$Zissou1[2], wes_palettes$Zissou1[3]) # set color palette colors
+img <- readPNG("figs/icons/BlackAndWhite_Water_Droplet.png") # read icon png from file
+grid::grid.raster(img)                # display img to check it
+g <- grid::rasterGrob(img, interpolate=TRUE)        
+
+## make plot
+clarity_boxplot <-
+  data_clarity %>%                    # replace w/data_clarity_highimpactsites for only those sites
+  ggplot(aes(x=treatment, y=water_clarity_m)) +             
+    geom_boxplot(notch = TRUE, color="grey28", aes(fill=treatment)) +
+    geom_jitter(color="grey28", size=2, alpha=0.1, width = 0.03) +
+    theme_bw() +
+    theme(panel.border = element_blank(), panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"), 
+    panel.background =
+      element_rect(fill = "transparent",colour = NA_character_), 
+      plot.background = element_rect(fill = "transparent", colour = NA_character_)) +
+    guides(fill="none") +  
+    theme(axis.text.x=element_text(angle = 60, vjust = 0.5)) +     
+    scale_fill_manual(values = pal) +
+    xlab("Period") +
+    ylab("Water clarity (m)") +
+    labs(tag = "A") +                    
+    annotation_custom(g, xmin = 1.6, xmax = 2.6,
+                       ymin = 17, ymax = 23)  # adds icon to plot (see aesthetics section above); 
+clarity_boxplot
+
+## test significance
+t.test(sqrt(water_clarity_m) ~ treatment, data_clarity) # 2-sample T-test
+
+# Explore water clarity responses to number of humans present per day
+
+## set up plot aesthetics (colors; icon)
+pal <- c(wes_palettes$Zissou1[2]) # set Wes Anderson color palette colors
+img <- readPNG("figs/icons/BlackAndWhite_Water_Droplet.png") # read icon png from file
+# img <- wrap.url(url, png::readPNG)                    # alternative: read png from the web 
+grid::grid.raster(img)                                  # display img to check it
+g <- grid::rasterGrob(img, interpolate=TRUE)        
+
+## make plot
+clarity_corplot_dailyhumans <-
+  data_clarity %>%                                          
+  ggplot(aes(x=human_count_day_total, y=log10(water_clarity_m))) + 
+    geom_point(color="grey28")+
+    geom_smooth(method=lm, color=pal)+
+    theme_bw() +
+    theme(panel.border = element_blank(), panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"),  
+    panel.background =
+      element_rect(fill = "transparent",colour = NA_character_), 
+      plot.background = element_rect(fill = "transparent", colour = NA_character_)) +
+    guides(fill="none") +
+    guides(fill="none") + 
+    theme(axis.text.x=element_text(angle = 60, vjust = 0.5)) +     
+    xlab("Daily human box office count") +
+    ylab("log10(Water clarity (m))") +
+    labs(tag = "B") 
+clarity_corplot_dailyhumans
+
+## test significance
+
+cor_clarity_dailyhumans <- lm(log10(data_clarity$water_clarity_m) ~ data_clarity$human_count_day_total, na.action=na.omit) # calc correlation coeffs 
+summary(cor_clarity_dailyhumans) 
+
+# Explore water clarity responses to number of humans in water at time of survey
+
+## test significance
+
+cor_clarity_sectorhumans <- lm(log10(data_clarity$water_clarity_m) ~ data_clarity$human_count_sector, na.action=na.omit) # calc correlation coeffs 
+summary(cor_clarity_sectorhumans) 
+
+```
+
+## Part 3: Monk seal presence
+
+```{r data_explore_monkseal, fig.height=5, fig.width=5, fig.align='center', fig.keep='none'}
+
+# Prep data
+
+## rename columns
+colnames(data_monk)[2] ="year"
+colnames(data_monk)[3] ="date"
+colnames(data_monk)[4] ="abundance"
+colnames(data_monk)[5] ="human_count_day_total"
+data_monk$treatment <- ifelse(data_monk$Open.Tuesday.COVID < "Closure", "open", "closed") 
+
+## Explore monk seal responses to human presence period (open vs closed)
+
+## test significance
+data_monk$bin <- data_monk$abundance
+data_monk$bin[data_monk$bin > 1] <- 1
+
+mod_monk <- glm(bin ~ treatment, family=binomial, data_monk)
+summary(mod_monk)                                 # Table S1 in manuscript
+inv.logit(-0.1431)
+inv.logit(-0.1431-1.1299)
+oo <- predict(mod_monk, list(treatment="open"), type="response", se.fit = TRUE)
+cc <- predict(mod_monk, list(treatment="closed"), type="response", se.fit = TRUE)
+
+seal_presence <- data.frame(treatment=c("open", "closed"), pct_days_present=c(oo$fit, cc$fit), lower=c(oo$fit-oo$se.fit, cc$fit-cc$se.fit), upper=c(oo$fit+oo$se.fit, cc$fit+cc$se.fit))
+
+## set up plot aesthetics (colors; icon)
+pal <- c(wes_palettes$Zissou1[2], wes_palettes$Zissou1[3]) # set Wes Anderson color palette colors
+img <- readPNG("figs/icons/BlackAndWhite_Monk_Seal.png") 
+grid::grid.raster(img)                  # display img to check it
+g <- grid::rasterGrob(img, interpolate=TRUE)        
+
+## make plot
+monk_pct_barplot <-
+  ggplot(seal_presence, aes(x=treatment, y=pct_days_present)) +             
+      geom_bar(colour="grey28", stat="identity", aes(fill=treatment)) +
+    geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2) +
+        theme_bw()  +    # theme below rms gridlines, alters legend, etc.
+        theme(panel.border = element_blank(), panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"),
+        panel.background =
+          element_rect(fill = "transparent",colour = NA_character_), 
+          plot.background = element_rect(fill = "transparent", colour = NA_character_)) +
+    guides(fill="none") +
+        guides(fill="none") + 
+        scale_fill_manual(values = pal) +
+        #ylim(0, 15) +      
+        xlab("Treatment") + 
+        ylab("     Monk seal presence 
+             (proportion of days with monk seals) +/- SE") +  # spaces are to align axis title better 
+        annotation_custom(g, xmin = 1.6, xmax = 2.3,
+                          ymin = 0.33, ymax = 0.44)
+monk_pct_barplot
+
+```
+
+## Part 4: Fish abundance
+
+```{r data_explore_fish_abundance_insitu_data, fig.height=5, fig.width=5, fig.align='center', fig.keep='none'}
+
+# Prep data
+
+## rename columns
+colnames(data_fish_all)[1] ="treatment"
+colnames(data_fish_all)[2] ="date"
+colnames(data_fish_all)[4] ="site"
+colnames(data_fish_all)[7] ="spp_richness"
+colnames(data_fish_all)[13] ="biomass_density"
+colnames(data_fish_all)[14] ="abundance_density"
+
+## rename values
+data_fish_all <- data_fish_all %>%
+    mutate(treatment = recode(treatment, Before = 'pre-COVID', During = 'COVID', After =  'post-COVID' ))
+
+## filter datasets by site (for plots/analyses below)
+data_fish_all_highestimpactsite <- data_fish_all[data_fish_all$site ==  "Keyhole",]
+data_fish_all_highimpactsites <- data_fish_all[data_fish_all$site == "Channel" | data_fish_all$site ==  "Keyhole",]
+                              
+## create and apply filters (optional)
+filter_site1 = "Keyhole"              # Keyhole and Channel = highest impact sites, in that order
+filter_site2 = "Channel"
+
+# Explore fish abundance responses to human presence period (open vs closed)
+## (in-situ fish observer data)
+
+## factorize treatment levels (for plot below)
+data_fish_all$treatment_factor <- factor(data_fish_all$treatment,levels = c("pre-COVID", "COVID", "post-COVID"))                          # used to order treatment levels in boxplot below
+data_fish_all_highestimpactsite$treatment_factor <- factor(data_fish_all_highestimpactsite$treatment,levels = c("pre-COVID", "COVID", "post-COVID"))                                              # as above, but for site-filtered dataset
+data_fish_all_highimpactsites$treatment_factor <- factor(data_fish_all_highimpactsites$treatment,levels = c("pre-COVID", "COVID", "post-COVID"))                                                # as above, but for site-filtered dataset              
+## set up plot aesthetics (colors; icon)
+pal <- c(wes_palettes$Zissou1[2], wes_palettes$Zissou1[3], wes_palettes$Zissou1[4]) 
+img1 <- readPNG("figs/icons/Chlorurus_Fishualize_Mirror.png") # read icon png from file
+img2 <- readPNG("figs/icons/BlackAndWhite_Acanthurus_triostegus.png") 
+img3 <- readPNG("figs/icons/BlackAndWhite_Caranx_melampygus.png") 
+grid::grid.raster(img)                  # display img to check it
+g1 <- grid::rasterGrob(img1, interpolate=TRUE)        
+g2 <- grid::rasterGrob(img2, interpolate=TRUE)        
+g3 <- grid::rasterGrob(img3, interpolate=TRUE)        
+
+## make plot
+abundance_violinplot <-
+  data_fish_all_highestimpactsite %>%    # change to data_fish_all to include all sites
+  ggplot(aes(x=treatment_factor, y=sqrt(abundance_density + 0.1))) + # add constant to allow sqrt
+    geom_violin(color="grey28", aes(fill=treatment), trim = FALSE, adjust = 1.75) + 
+                                                    # adjust smooths violin (default=1)
+    geom_boxplot(width=0.01) +                      # adds boxplot stats
+    stat_summary(fun=mean, geom="point", size=3.5, col = "grey28") +  # adds points for mn
+    geom_jitter(color="grey28", size=0.8, alpha=0.9, width = 0.05) +
+    theme_bw() +
+    theme(panel.border = element_blank(), panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"),
+    panel.background =
+      element_rect(fill = "transparent",colour = NA_character_), 
+      plot.background = element_rect(fill = "transparent", colour = NA_character_)) +
+    guides(fill="none") +  
+    theme(axis.text.x=element_text(angle = 60, vjust = 0.5)) +     
+    scale_fill_manual(values = pal) +
+    xlab("Period") +
+    ylab("sqrt(Fish density)")  +     # as(N/m2)
+    labs(tag = "A") +                 # add panel lettering 
+    annotation_custom(g1, xmin = 1.0, xmax = 1.7,
+                      ymin = 1.5, ymax = 2.00)  + # adds icon to plot (see aesthetics section above)  
+    annotation_custom(g2, xmin = 1.0, xmax = 1.75,
+                      ymin = 1.80, ymax = 2.15)  + 
+    annotation_custom(g3, xmin = 1.05, xmax = 1.75,
+                      ymin = 0.85, ymax = 2.05) # +
+abundance_violinplot
+
+## test significance
+abundance_aov <- aov(abundance_density ~ treatment, data = data_fish_all_highestimpactsite)
+summary(abundance_aov)                # 1-way anova tests global difference (among all levels)
+
+mod <- lm(abundance_density ~ treatment, data = data_fish_all_highestimpactsite)
+summary(mod)                           
+anova(mod, test="F")                   
+mod2 <- lm(abundance_density ~ treatment + TRANSECT, data = data_fish_all_highestimpactsite)
+drop1(mod2, test="F")
+summary(mod2)                          
+
+abundance_paired_t <- pairwise.t.test(data_fish_all_highestimpactsite$abundance_density, data_fish_all_highestimpactsite$treatment)
+abundance_paired_t                    # pairwise t-tests w/p-vals adjusted for multiple tests
+
+```
+
+
+```{r data_explore_fish_abundance_cameratrap_data, fig.height=5, fig.width=5, fig.align='center', fig.keep='none'}
+
+# Prep data
+
+## subset dataset
+dat <- data
+dat <- data[c("location", "site", "transect", "date", "organism_enter_time", "organism_leave_time", "common_name")]
+dat$id <- apply(dat[c("location", "site", "transect", "date")], 1, paste0, collapse="-")
+
+## calculate enter & leave times
+max(dat$organism_leave_time, na.rm=TRUE)
+min(dat$organism_enter_time, na.rm=TRUE)
+time_min <- 500
+time_max <- 31*60
+
+human <- aggregate(common_name ~ id, dat, function(x) {if(any(x=="Human")) TRUE else FALSE})
+names(human) <- c("id", "human")
+dat <- merge(dat, human)
+dat <- dat[dat$human,] # only look at transects where human seen
+ids <- unique(dat$id)
+length(ids)
+
+## get raw counts of fish and humans for each second of time series
+counts <- data.frame()
+
+for (i in 1:length(ids)) {
+  temp <- dat[dat$id == ids[i],]
+  temp <- temp[!is.na(temp$organism_enter_time),]
+  temp <- temp[!is.na(temp$organism_leave_time),]
+
+  store <- data.frame()
+  for (t in time_min:time_max) {
+    n <- 0
+    h <- 0
+    for (j in 1:nrow(temp)) {
+      if (t >= temp$organism_enter_time[j] & t <= temp$organism_leave_time[j]) {
+        if (temp$common_name[j]=="Human") {
+          h <- h + 1
+        } else {
+          n <- n + 1
+        }
+      }
+    }
+    store <- rbind(store, data.frame(rep=ids[i], time=t, fish=n, human=h))
+  }
+  counts <- rbind(counts, store)
+}
+
+counts$human_binom <- sapply(counts$human, function(x) { if (x>0) TRUE else FALSE })
+write.csv(counts, "output/abundance_instantaneoushumanpresence_counts.csv", row.names=FALSE)
+
+## create immediate human presence periods
+p <- 25                               # set the number of seconds in the before & after periods, 
+                                      # humans don't hang around that long (usually ~ 5-10 seconds) 
+periods <- data.frame()
+
+for (i in 2:(nrow(counts)-1)) {
+  if (counts$human[i] > 0 & counts$human[i-1] == 0) {
+    periods <- rbind(periods, cbind(counts[seq(i-p, i-1),], data.frame(period=rep("before", p))))
+    periods <- rbind(periods, cbind(counts[i,], data.frame(period="during")))
+  }
+  if (counts$human[i] > 0 & counts$human[i-1] > 0) {
+    periods <- rbind(periods, cbind(counts[i,], data.frame(period="during")))
+  }
+  if (counts$human[i] == 0 & counts$human[i-1] > 0) {
+    periods <- rbind(periods, cbind(counts[seq(i, i+p-1),], data.frame(period=rep("after", p))))
+  }
+}
+write.csv(periods, "output/abundance_instantaneoushumanpresence_periods.csv", row.names=FALSE)
+
+periods$period <- factor(periods$period, levels = c("before", "during", "after"))
+
+# Explore fish behavioral responses to immediate human presence in water
+## (camera trap data)
+
+## test significance
+mod_instantaneoushumanpresence <- glm(fish ~ period, periods, family=quasipoisson)
+summary(mod_instantaneoushumanpresence)
+
+mod_instantaneoushumanpresence2 <- glmer(fish ~ period + (1|rep), periods, family=poisson)
+summary(mod_instantaneoushumanpresence2)    # rep is date + site combo, added as random effect
+
+## set up plot aesthetics (colors; icon)
+pal <- c(wes_palettes$Zissou1[2], wes_palettes$Zissou1[4], wes_palettes$Zissou1[1]) # set colors
+
+## make plot
+fishdensity_instantaneoushumanpresence_boxplot <-
+  periods %>%
+  ggplot(aes(x=period, y=sqrt(fish))) + 
+    geom_boxplot(notch = TRUE, color="grey28", aes(fill=period)) +  
+          # notches interpretation: non-overlapping = true difference in means
+    #scale_fill_viridis(discrete = TRUE, alpha=0.6) +
+    geom_jitter(color="grey28", size=0.4, alpha=0.7, width = 0.05) +
+    theme_bw() +
+    theme(panel.border = element_blank(), panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"),
+    panel.background =
+      element_rect(fill = "transparent",colour = NA_character_), 
+      plot.background = element_rect(fill = "transparent", colour = NA_character_)) +
+    guides(fill="none") +  
+    theme(axis.text.x=element_text(angle = 60, vjust = 0.5)) +     
+    scale_fill_manual(values = pal) +
+    xlab("") +                                            
+    xlab("Immediate human presence") +
+    ylab("sqrt(Fish abundance)") +                      
+    labs(tag = "B") # +               # add panel lettering (for multi-panel plotting) 
+fishdensity_instantaneoushumanpresence_boxplot
+
+```
+
+## Part 5: Fish behavior
+
+```{r data_explore_fish_behavior_biterate, fig.height=5, fig.width=5, fig.align='center', fig.keep='none'}
+
+# Prep data
+
+## calculate video observation time by date
+observation_time_by_date <-
+    data_summary %>%
+      group_by(treatment, date) %>%
+      summarise(minutes_analysed_per_date = sum(segments_analysed, na.rm=TRUE))
+observation_time_by_date
+
+## scale bites by observation time
+herbivory_summary_by_date_scaled <- 
+    data %>% 
+      group_by(treatment, date) %>% 
+      summarise(total_bites_per_obs_time = sum(bites_total, na.rm = TRUE) / length(unique(segment, na.rm=TRUE)))
+herbivory_summary_by_date_scaled[3] <- herbivory_summary_by_date_scaled[3] / observation_time_by_date[3]
+herbivory_summary_by_date_scaled        
+
+# Explore fish herbivory responses to human presence period
+
+## look across all species/sites & scale bites by observation time
+herbivory_summary_by_trtmt_scaled <- 
+    data %>% 
+      group_by(treatment) %>% 
+      summarise(total_bites_per_obs_time = sum(bites_total, na.rm = TRUE) / length(unique(segment, na.rm=TRUE)))
+herbivory_summary_by_trtmt_scaled[2] <- herbivory_summary_by_trtmt_scaled[2] / observation_time_by_treatment[2]
+herbivory_summary_by_trtmt_scaled          
+
+## set up plot aesthetics (colors; icon)
+pal <- c(wes_palettes$Zissou1[2], wes_palettes$Zissou1[3]) # set Wes Anderson color palette colors
+img1 <- readPNG("figs/icons/BlackAndWhite_Acanthurus_triostegus.png") 
+img2 <- readPNG("figs/icons/Chlorurus_Fishualize_Mirror.png") # read icon png from file
+# img <- wrap.url(url, png::readPNG)                    # alternative: read png from the web 
+grid::grid.raster(img)                                  # display img to check it
+g1 <- grid::rasterGrob(img1, interpolate=TRUE)        
+g2 <- grid::rasterGrob(img2, interpolate=TRUE)        
+
+## make plot
+herbivory_barplot <-
+  herbivory_summary_by_trtmt_scaled %>%
+  ggplot(aes(x=treatment, y=total_bites_per_obs_time)) +             
+    geom_bar(colour="grey28", stat="identity", aes(fill=treatment)) +
+      theme_bw()  +    # theme below rms gridlines, alters legend, etc.
+      theme(panel.border = element_blank(), panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"),
+      panel.background =
+        element_rect(fill = "transparent",colour = NA_character_), 
+      plot.background = element_rect(fill = "transparent", colour = NA_character_), 
+      axis.text.x=element_text(angle = 60, vjust = 0.5)) +
+      guides(fill="none") + 
+      scale_fill_manual(values = pal) +
+      #ylim(0, 15) +      
+      xlab("") +                        # suppress axis label
+      ylab("Bite rate") +                 
+      labs(tag = "A") +                 # add panel lettering (for multi-panel plotting)
+      annotation_custom(g1, xmin = 1.5, xmax = 2.5,
+                      ymin = 2.3, ymax = 3.6)  +
+      annotation_custom(g2, xmin = 1.5, xmax = 2.5,
+                      ymin = 1.7, ymax = 3.2)   # adds icon to plot
+herbivory_barplot
+
+## create filters to use in plot (optional)
+filter_family = "parrotfish"
+filter_site1 = "Keyhole"        
+
+## create summary dataset to see what is important - site, etc.
+herb_net_allsites <- data %>%           # mean net herbivory by treatment, scaled by observ time
+  group_by(treatment, date_numeric, site) %>%
+  filter(family == filter_family) %>%   # optional filter term
+  #filter(site == filter_site1) %>%     # optional filter term; un-comment for highest-impact site
+  summarise(bites_mn = mean(bites_total, na.rm = TRUE),  # bites_mn avgs over # of fish/fish groups
+    bites_max = max(bites_total, na.rm = TRUE), 
+    bites_total = sum(bites_total, na.rm = TRUE), 
+    segments_analysed = length(unique(segment, na.rm=TRUE)), 
+                                        # NOTE: when filtering by family, it's only including in this 
+                                        # summary tibble (herb_net) the unique segments where those 
+                                        # fish were observed
+    bites_mn_per_obs_time =  mean(bites_total, na.rm = TRUE) / length(unique(segment, na.rm=TRUE)),
+    bites_max_per_obs_time = max(bites_total, na.rm = TRUE) / length(unique(segment, na.rm=TRUE)),
+    bites_total_per_obs_time = sum(bites_total, na.rm = TRUE) / length(unique(segment, na.rm=TRUE)),
+                                        # above three variables avg over # time segments
+    sector_count = unique(sector_count) # only one value per site/date combo
+  ) 
+herb_net_allsites
+
+## test significance
+aov_bites_total <- aov(bites_total_per_obs_time ~ treatment + site, data = herb_net_allsites)
+summary(aov_bites_total)                # 1-way anova tests global difference (among all levels)
+#TukeyHSD(aov_bites_total)              # Tukey post-hoc test
+                                        
+## adjust summary dataset to use in the next few plots - focus only on highest-impact site (Keyhole)
+herb_net <- data %>%                    # mean net herbivory by treatment, scaled by observ time
+  group_by(treatment, date_numeric, site) %>%
+  filter(family == filter_family) %>%   # optional filter term
+  filter(site == filter_site1) %>%      # optional filter term
+  summarise(bites_mn = mean(bites_total, na.rm = TRUE),  # bites_mn avgs over # of fish/fish groups
+    bites_max = max(bites_total, na.rm = TRUE), 
+    bites_total = sum(bites_total, na.rm = TRUE), 
+    segments_analysed = length(unique(segment, na.rm=TRUE)),                                         
+                                        # NOTE: when filtering by family, it's only including in this 
+                                        # summary tibble (herb_net) the unique segments where those 
+                                        # fish were observed
+    bites_mn_per_obs_time =  mean(bites_total, na.rm = TRUE) / length(unique(segment, na.rm=TRUE)),
+    bites_max_per_obs_time = max(bites_total, na.rm = TRUE) / length(unique(segment, na.rm=TRUE)),
+    bites_total_per_obs_time = sum(bites_total, na.rm = TRUE) / length(unique(segment, na.rm=TRUE)),
+                                        # above three variables avg over # time segments
+    sector_count = unique(sector_count) # only one value per site/date combo
+  ) 
+herb_net
+
+# Explore fish herbivory responses to human presence period - for specific fish families
+
+## note: when subsetted by fish family, this plot / analysis answers the question (for example), "*When parrotfish were present*, did their bite rate change as a function of human presence?". Noting this because it scales the bites (mn or max) by the number of video segments that included that family, not by the total number of video segments analysed for that site (some of which had no parrotfish present). 
+
+## test significance
+tt_total <- t.test(bites_total_per_obs_time ~ treatment, herb_net)        # 2-sample T-test
+
+## set up plot aesthetics (colors; icon)
+pal <- c(wes_palettes$Zissou1[2], wes_palettes$Zissou1[3]) # set Wes Anderson color palette colors
+img <- readPNG("figs/icons/Chlorurus_Fishualize_Mirror.png") # read icon png from file
+# img <- wrap.url(url, png::readPNG)                    # alternative: read png from the web 
+grid::grid.raster(img)                                  # display img to check it
+g <- grid::rasterGrob(img, interpolate=TRUE)      
+
+## make plot
+herbivory_violinplot <-
+  herb_net %>%
+  ggplot(aes(x=treatment, y=bites_total_per_obs_time)) + 
+    geom_violin(colour="grey28", aes(fill=treatment), trim = FALSE, adjust = 1.75) + 
+                                                  # adjust smooths violin (default=1)
+    geom_boxplot(width=0.01) +                    # adds boxplot stats
+    stat_summary(fun=mean, geom="point", size=3, col = "grey28") +  # adds points for mn
+    geom_jitter(color="grey28", size=1, alpha=0.9, width = 0.05) +
+    theme_bw() +
+    theme(panel.border = element_blank(), panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"),    
+    panel.background =
+      element_rect(fill = "transparent",colour = NA_character_), 
+      plot.background = element_rect(fill = "transparent", colour = NA_character_),
+    axis.text.x=element_text(angle = 60, vjust = 0.5)) +
+    guides(fill="none") +  
+    scale_fill_manual(values = pal) +
+    xlab("") +                                            
+    xlab("Period") +
+    ylab("Bite rate") +            
+    labs(tag = "B") +                   # add panel lettering (for multi-panel plotting) 
+    annotation_custom(g, xmin = 0.8, xmax = 3.1,
+                      ymin = 3.8, ymax = 9.0) # adds icon to plot (see aesthetics section above);
+herbivory_violinplot
+
+```
+
+
+```{r data_explore_behavior_biterate_2, fig.height=5, fig.width=5, fig.align='center', fig.keep='none'}
+
+# Prep data
+
+herb_net_nonzero <- herb_net[herb_net$bites_mn != 0,] # creates non-zero herbivory dataset
+herbivory_corplot <-
+  herb_net %>%                          
+  ggplot(aes(x=sector_count, y=log10(bites_mn_per_obs_time))) + 
+    geom_point()+
+    geom_smooth(method=lm)+
+    theme_bw() +
+    theme(panel.border = element_blank(), panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) +
+    guides(fill="none") + 
+    theme(axis.text.x=element_text(angle = 60, vjust = 0.5)) +     
+    ggtitle("Herbivores (parrotfishes)") + # change to match dataset_used grouping
+    xlab("Mean humans present over observation period") +
+    ylab("log10(Total bites, scaled by observation time)") +
+    labs(tag = "A")                   # add panel lettering (for multi-panel plotting)
+herbivory_corplot
+
+# Explore fish herbivory responses to human presence in water
+
+## test significance
+cor_mean <- lm(herb_net$bites_mn_per_obs_time ~ herb_net$sector_count, na.action=na.omit) # calc correlation coeffs 
+summary(cor_mean)                                               
+cor_max <- lm(herb_net$bites_max_per_obs_time ~ herb_net$sector_count, na.action=na.omit)
+summary(cor_max)
+
+```
+
+
+```{r data_explore_behavior_biterate_3, fig.height=5, fig.width=5, fig.align='center', fig.keep='none'}
+
+## Using sector_count as metric of human presence & individual fish* total bites as response variable
+### *for individual fish (when observed solo) or by conspecific fish group (when observed in a group)
+
+##### Note: here, bites don't need to be scaled by total observation time, since all site/date combos had the same # of video  minutes analysed (~15) and this analysis is at the site/date combo level
+
+# Prep data
+
+## subset data
+data_herbonly <- data[data$family == "surgeonfish" | data$family == "parrotfish",] 
+                                      # creates herbivore-only dataset; 
+                                    # could also add in damsels, though some are planktivores...
+data_parrotsonly <- data[data$family == "parrotfish",]         
+data_surgeonsonly <- data[data$family == "surgeonfish",]         
+data_othersonly <- data[data$family == "other",]         
+data_herbonly_highimpactsites <- data_highimpactsites[data_highimpactsites$family == "surgeonfish" | data_highimpactsites$family == "parrotfish",] # to use only using high-impact sites            
+data_parrotsonly_highimpactsites <- data_highimpactsites[data_highimpactsites$family == "parrotfish",]
+data_surgeonsonly_highimpactsites <- data_highimpactsites[data_highimpactsites$family == "surgeonfish",]                                  
+
+# Explore fish herbivory responses to human presence in water (using quantile regression)
+
+## test significance 
+pctile <- 0.99                          # set %ile of interest here
+dataset_used <- data_herbonly    
+cor_bitestotal_quant <- rq(log10(bites_total + 1) ~ sector_count, data = dataset_used, tau = pctile) 
+                                        # tau = percentile (0-1) 
+summ(cor_bitestotal_quant)              # had to add constant (0.5) to allow log10 transform
+
+## set up plot aesthetics (colors; icon)
+pal <- c(wes_palettes$Zissou1[2]) # set Wes Anderson color palette colors
+img1 <- readPNG("figs/icons/BlackAndWhite_Acanthurus_triostegus.png") 
+img2 <- readPNG("figs/icons/Chlorurus_Fishualize_Mirror.png") # read icon png from file
+grid::grid.raster(img)                  # display img to check it
+g1 <- grid::rasterGrob(img1, interpolate=TRUE)        
+g2 <- grid::rasterGrob(img2, interpolate=TRUE)  
+
+## make plot
+herbivory_corplot_qr <-
+  dataset_used %>%                                                
+  ggplot(aes(x=sector_count, y=log10(bites_total + 1))) + 
+    geom_point(color="grey28") +
+    geom_abline(intercept=coef(cor_bitestotal_quant)[1], slope=coef(cor_bitestotal_quant)[2], colour=pal, size = 2) +
+    theme_bw() +
+    theme(panel.border = element_blank(), panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"),
+    panel.background =
+      element_rect(fill = "transparent",colour = NA_character_), 
+      plot.background = element_rect(fill = "transparent", colour = NA_character_)) +
+    guides(fill="none") + 
+    theme(axis.text.x=element_text(angle = 60, vjust = 0.5)) +     
+    xlab("") +                                            
+    xlab("Humans present (N)") +
+    ylab("Total bites") +    
+    labs(tag = "A") +                 # add panel lettering (for multi-panel plotting)
+    #ggtitle("Herbivores (surgeonfishes & parrotfishes)") + # change to match dataset_used grouping
+    theme(plot.title = element_text(hjust = 0.5)) + # centers plot title
+    annotation_custom(g1, xmin = 33, xmax = 48,
+                      ymin = 2.5, ymax = 4.0)  +
+    annotation_custom(g2, xmin = 33, xmax = 48,
+                      ymin = 1.8, ymax = 3.4) # + # adds icon to plot (see aesthetics section above); 
+herbivory_corplot_qr
+
+```
+
+
+```{r data_explore_behavior_time_budget, fig.height=5, fig.width=5, fig.align='center', fig.keep='none'}
+
+# Explore fish time budget responses (% time engaged in various behaviors) to human presence period
+
+# Prep data
+
+## create summary dataset 
+behav_net <- data %>%                 # calc. mean net behaviour by treatment, scaled by observ time
+  group_by(treatment, date_numeric, site) %>%
+  #filter(family == "parrotfish") %>% # optional filter term
+  #filter(site == "Channel" | site ==  "Keyhole") %>% # optional filter term
+  summarise(behav_mn = mean(attacking, na.rm = TRUE), # can replace attacking w/other behaviours 
+  sector_count = unique(sector_count) # there's only one value per site/date combo
+  ) 
+behav_net
+
+# Explore fish time budget responses to human presence in water
+
+## create model
+mod2_attacking <- zeroinfl(attacking ~ sector_count, dist="poisson", data=data)
+mod3_attacking <- zeroinfl(attacking ~ sector_count | sector_count, dist="poisson", data=data)
+predict(mod3_attacking, list(sector_count=1:50))
+
+## make plot - simple correlation
+plot(attacking ~ sector_count, data)
+lines(0:48, predict(mod3_attacking, list(sector_count=0:48)) * 100)
+summary(mod3_attacking)
+
+## prep for quantile regression
+pctile <- 0.99                        # set %ile of interest (0-1)
+dataset_used <- data_herbonly                        
+
+## set up plot aesthetics (colors; icon)
+img1 <- readPNG("figs/icons/BlackAndWhite_Acanthurus_triostegus.png") 
+img2 <- readPNG("figs/icons/Chlorurus_Fishualize_Mirror.png") # read icon png from file
+grid::grid.raster(img)                # display img to check it
+g1 <- grid::rasterGrob(img1, interpolate=TRUE)        
+g2 <- grid::rasterGrob(img2, interpolate=TRUE)  
+
+## make plot - quantile regression
+behav_indiv_corplot_qr <-
+  dataset_used %>%
+  ggplot(aes(x=jitter(sector_count, 10), y=jitter(asin(sqrt(attacking/100))), 5)) + # jitter 
+    geom_point(color="grey28") +
+    theme_bw() +
+    theme(panel.border = element_blank(), panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"), 
+    panel.background =
+      element_rect(fill = "transparent",colour = NA_character_), 
+      plot.background = element_rect(fill = "transparent", colour = NA_character_)) +
+    guides(fill="none") +
+    theme(axis.text.x=element_text(angle = 60, vjust = 0.5)) +
+    #xlab("") +                                            
+    xlab("Humans present (N)") +
+    ylab("Time spent attacking") +      # change to match behavior used
+    labs(tag = "C") +                   # add panel lettering (for multi-panel plotting)
+    theme(plot.title = element_text(hjust = 0.5)) + # centers plot title
+    annotation_custom(g1, xmin = 32, xmax = 49,
+                      ymin = 0.8, ymax = 2.05)  +
+    annotation_custom(g2, xmin = 31, xmax = 49,
+                      ymin = 0.65, ymax = 1.50) # + # adds icon to plot 
+behav_indiv_corplot_qr
+
+## test significance
+cor_behav_individual_quant <- rq(asin(sqrt(attacking/100)) ~ sector_count, data = dataset_used, tau = pctile, na.action = na.omit)
+summ(cor_behav_individual_quant, se = "boot")        # use bootstrap to calc st err; 
+
+```
+
+## Part 6: Manuscript figures
+
+```{r compiling_manuscript_figs, echo=FALSE, results='hide', message=FALSE}
+
+## Fig. 1: Conceptual plot (made outside of R)
+
+## Fig. 2: 2-panel plot of water clarity
+
+(clarity_boxplot + plot_spacer()) / (clarity_corplot_dailyhumans + plot_spacer())
+
+dev.copy(png,"output/waterclarity_covidstatusandboxofficeccount.png", width=400, height=400, bg = "transparent")
+dev.off()
+dev.copy(pdf,"output/waterclarity_covidstatusandboxofficeccount.pdf", width=4, height=4)
+dev.off()
+
+## Fig. 3: 1-panel plot of monk seal presence
+
+monk_pct_barplot
+
+dev.copy(png,"output/monkseal_pctdayspresent.png", width=400, height=400)
+dev.off()
+dev.copy(pdf,"output/monkseal_pctdayspresent.pdf", width=4, height=4)
+dev.off()
+
+## Fig. 4: 2-panel plot of fish density 
+
+(abundance_violinplot + plot_spacer()) / (fishdensity_instantaneoushumanpresence_boxplot + plot_spacer())
+
+dev.copy(png,"output/fishdensity_violinplot_boxplot.png", width=400, height=400)
+dev.off()
+dev.copy(pdf,"output/fishdensity_violinplot_boxplot.pdf", width=4, height=4)
+dev.off()
+
+## Fig. 5: 3-panel plot of herbivory & other behavior 
+
+(herbivory_corplot_qr + herbivory_violinplot) /  (behav_indiv_corplot_qr) 
+
+dev.copy(png,"output/herbivory_boxplot_corplotquant_attackingcorplotquant.png", width=400, height=400)
+dev.off()
+dev.copy(pdf,"output/herbivory_boxplot_corplotquant_attackingcorplotquant.pdf", width=4, height=4)
+dev.off()
+
+```
+
+## Part 7: Statistical analyses
+
+Analyses below correspond to figures above, in same order
+
+```{r analysis, echo=FALSE, results='hide'}
+
+t.test(sqrt(water_clarity_m) ~ treatment, data_clarity)# Fig. 1A (2-sample T-test)
+
+summary(cor_clarity_sectorhumans)                      # Fig. 2B  
+
+# (no analysis for this fig.)                          # Fig. 3 - monk seals  
+
+summary(abundance_aov)                                 # Fig. 4A - 1-way anova 
+                                                          # tests global difference               
+                                                          # (among all levels)
+TukeyHSD(abundance_aov)                                # Tukey post-hoc test
+
+abundance_paired_t                                     # Fig. 4B 
+                                                          # pairwise t-tests w/               
+                                                          # p-vals adjusted for                                                                                # multiple tests 
+
+summary(mod_instantaneoushumanpresence)                # Fig. 4B   
+
+summ(cor_bitestotal_quant)                             # Fig. 5A   
+
+summary(aov_bites_total)                               # Fig. 5B 
+
+tt_total                                               # Fig. 5B 
+
+# (no analysis for this fig.)                          # Fig. 5C   
+
+summary(mod_monk)                                      # Table S1 
+
+summary(mod)                                           # Table S2A
+summary(mod2)                                          # Table S2A
+
+summary(mod_instantaneoushumanpresence2)               # Table S3
+
+summary(mod2_attacking)                                # Table S4
+
+```
+
